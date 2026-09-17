@@ -21,6 +21,12 @@ export type ToolCallRecord = {
     at: string;
 };
 
+export type TrafficRecord = {
+    kind: string;
+    detail: string;
+    at: string;
+};
+
 type MessageStateType = { calls: ToolCallRecord[] };
 type ChatStateType = { totalCalls: number };
 type ConfigType = { echoPrefix?: string };
@@ -29,6 +35,8 @@ export class Stage extends StageBase<any, ChatStateType, MessageStateType, Confi
 
     calls: ToolCallRecord[];
     notes: string[] = [];
+    traffic: TrafficRecord[] = [];
+    environment: string = 'unknown';
     configPrefix: string;
     private rosterCharacters: { [key: string]: Character } = {};
     private rosterUsers: { [key: string]: User } = {};
@@ -43,7 +51,9 @@ export class Stage extends StageBase<any, ChatStateType, MessageStateType, Confi
         this.rosterUsers = users ?? {};
         this.calls = messageState?.calls ?? [];
         this.configPrefix = (config as ConfigType | null)?.echoPrefix ?? 'stage says';
+        this.environment = String(environment);
 
+        this.watchHostTraffic();
         this.registerTools();
 
         // Exposed on the instance: also callable via the host's CALL
@@ -55,6 +65,36 @@ export class Stage extends StageBase<any, ChatStateType, MessageStateType, Confi
             users: Object.keys(users).length,
             environment,
         });
+    }
+
+    /***
+     Passive observer: logs every message the host page posts into this iframe.
+     Completely read-only -- proves whether the host ever attempts an MCP
+     handshake (initialize / tools/list), independent of the model's behavior.
+     ***/
+    private watchHostTraffic() {
+        if (typeof window === 'undefined' || window.parent === window) return;
+        window.addEventListener('message', (event) => {
+            try {
+                const d = event.data;
+                if (d == null || typeof d !== 'object') return;
+                if (d.type === 'mcp-message' && d.payload != null) {
+                    const msgs = Array.isArray(d.payload) ? d.payload : [d.payload];
+                    for (const m of msgs) {
+                        this.logTraffic('MCP', (m as any)?.method ?? 'response/id:' + ((m as any)?.id ?? '?'));
+                    }
+                } else if (typeof d.type === 'string' && d.type.startsWith('iframe-')) {
+                    this.logTraffic('HOST', d.type);
+                } else if (typeof d.messageType === 'string') {
+                    this.logTraffic('HOST', d.messageType);
+                }
+            } catch { /* observer must never throw */ }
+        });
+    }
+
+    private logTraffic(kind: string, detail: string) {
+        this.traffic = [...this.traffic.slice(-49), {kind, detail, at: new Date().toISOString()}];
+        this.notify();
     }
 
     private record(tool: string, args: Record<string, any>, result: string) {
@@ -212,10 +252,27 @@ function SpikePanel({stage}: { stage: Stage }) {
             Every invocation is logged below.
         </div>
         <div style={{marginBottom: 8}}>
+            <b>Environment:</b> {stage.environment}
+        </div>
+        <div style={{marginBottom: 8}}>
             <b>Registered:</b> stage_ping · current_time · chat_roster · stage_note
         </div>
         <div style={{marginBottom: 8}}>
             <b>Calls observed by stage:</b> {stage.calls.length}
+        </div>
+        <div style={{marginBottom: 8}}>
+            <b>Host traffic into iframe</b> <span style={{opacity: 0.6}}>(INIT/BEFORE/AFTER = chat lifecycle · MCP initialize/tools-* = MCP session)</span>:
+            {stage.traffic.length === 0 && <div style={{opacity: 0.6}}>none observed</div>}
+            {stage.traffic.length > 0 && <div style={{
+                maxHeight: 140, overflowY: 'auto', marginTop: 4,
+                border: '1px solid rgba(120,160,255,0.18)', borderRadius: 6, padding: '4px 6px'
+            }}>
+                {[...stage.traffic].reverse().map((t, i) => (
+                    <div key={i} style={{opacity: 0.75}}>
+                        {t.at.slice(11, 19)} <b>{t.kind}</b> {t.detail}
+                    </div>
+                ))}
+            </div>}
         </div>
         {stage.notes.length > 0 && <div style={{marginBottom: 8}}>
             <b>Notes from the model:</b>
