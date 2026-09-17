@@ -1,0 +1,90 @@
+name: Deploy Built Stage
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: '24.x'
+
+      - name: Confirm CHUB_AUTH_TOKEN is set
+        env:
+          CHUB_AUTH_TOKEN: ${{ secrets.CHUB_AUTH_TOKEN }}
+        run: |
+          if [ "${{ secrets.CHUB_AUTH_TOKEN }}" == "" ] || [ "${{ secrets.CHUB_AUTH_TOKEN }}" == "null" ]; then
+             echo "Your CHUB_AUTH_TOKEN secret is not set for this project. Cannot proceed."
+             exit 1
+          fi
+
+      - name: Get or Make Stage ID
+        env:
+          CHUB_AUTH_TOKEN: ${{ secrets.CHUB_AUTH_TOKEN }}
+          STAGE_ID: ${{ secrets.STAGE_ID }}
+        run: |
+          mkdir -p public/
+          touch public/chub_meta.yaml
+          if grep -q "^github_path:" public/chub_meta.yaml; then
+            echo "Repo path already in metadata file."
+          else
+            echo "Writing github path 'https://github.com/${{ github.repository }}' to metadata file."
+            echo -e "\ngithub_path: 'https://github.com/${{ github.repository }}'\n" >> public/chub_meta.yaml
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git add public/chub_meta.yaml
+            git commit -m "Add github_path to chub_meta.yaml" || true
+            git push
+          fi
+          if [ "${{ secrets.STAGE_ID }}" == "" ]; then
+             echo "Secret STAGE_ID does not exist; attempting to read from file"
+             STAGE_ID=$(grep '^extension_id:' public/chub_meta.yaml | cut -d ':' -f2 | tr -d " '\"")
+             if [ "${STAGE_ID}" == ""  ]; then
+                echo "Extension ID not present in public/chub_meta.yaml extension_id field either. Creating new project."
+                sudo apt-get install jq
+                STAGE_ID=""
+                curl -H "CH-API-KEY: ${{ secrets.CHUB_AUTH_TOKEN }}" -H "Content-Type: application/json" --request POST --data '{"name":"${{ github.event.repository.name }}"}'  https://api.chub.ai/extensions  -o creation.json
+                STAGE_ID=$(jq -r '.id_v2' creation.json)
+                if [ "${STAGE_ID}" == "" ] || [ "${STAGE_ID}" == "null" ]; then
+                  echo "Extension ID creation failed; is your CHUB_AUTH_TOKEN secret set for this project?"
+                  exit 1
+                fi
+                echo -e "\nextension_id: '${STAGE_ID}'\n" >> public/chub_meta.yaml
+                git config --local user.email "action@github.com"
+                git config --local user.name "GitHub Action"
+                git add public/chub_meta.yaml
+                git commit -m "Add new Extension ID to chub_meta.yaml" || true
+                git push
+             else
+                echo "Extension ID found in public/chub_meta.yaml."
+             fi
+          else
+             STAGE_ID=${{ secrets.STAGE_ID }}
+          fi
+          echo "STAGE_ID=${STAGE_ID}" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Zip the build folder
+        run: cd dist && zip -r ../build.zip * && cd ../
+
+      - name: Upload the build
+        env:
+          CHUB_AUTH_TOKEN: ${{ secrets.CHUB_AUTH_TOKEN }}
+        run: |
+          curl -H "CH-API-KEY: ${{ secrets.CHUB_AUTH_TOKEN }}" -F "file=@build.zip" https://api.chub.ai/extension/${{ env.STAGE_ID }}/upload

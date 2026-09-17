@@ -1,0 +1,20 @@
+# Metadata for this stage. All fields optional.
+project_name: "MCP Spike"
+tagline: "Probing whether stage-registered MCP tools reach the chat model."
+visibility: 'PRIVATE'
+position: 'ADJACENT'
+tags:
+  - 'Stage'
+  - 'MCP'
+  - 'Spike'
+
+config_schema:
+  type: object
+  title: Spike Config
+  description: Minimal config to also verify config delivery into the stage.
+  properties:
+    echoPrefix:
+      type: string
+      title: Echo prefix
+      description: Prepended to the output of the stage_ping tool.
+      default: 'stage says'

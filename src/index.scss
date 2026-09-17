@@ -1,0 +1,14 @@
+:root {
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+// The stage iframe composits over/inside the chat page, so keep the
+// page background transparent. UI elements paint their own backgrounds.
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}

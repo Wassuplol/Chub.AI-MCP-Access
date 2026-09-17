@@ -1,0 +1,31 @@
+{
+  "users": {
+    "0": {
+      "anonymizedId": "0",
+      "name": "You",
+      "isRemoved": false,
+      "chatProfile": "Test user persona."
+    }
+  },
+  "characters": {
+    "1": {
+      "anonymizedId": "1",
+      "name": "Janessa",
+      "isRemoved": false,
+      "description": "Janessa is a test character.",
+      "example_dialogs": "Hi! What's up?",
+      "personality": "Cheerful, normal, helpful",
+      "first_message": "How are you?",
+      "scenario": "You're having a coffee with her at work.",
+      "tavern_personality": "",
+      "system_prompt": "",
+      "post_history_instructions": "",
+      "alternate_greetings": [],
+      "partial_extensions": {
+        "chub": {
+          "background_image": null
+        }
+      }
+    }
+  }
+}
