@@ -18,3 +18,6 @@ config_schema:
       title: Echo prefix
       description: Prepended to the output of the stage_ping tool.
       default: 'stage says'
+
+github_path: 'https://github.com/Wassuplol/Chub.AI-MCP-Access'
+
