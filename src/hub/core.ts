@@ -10,7 +10,7 @@ import {z} from "zod";
 import {Client} from "@modelcontextprotocol/sdk/client/index.js";
 import {StreamableHTTPClientTransport} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
-    aliasSlug, ComfyRunResult, GalleryItem, HubEvent, HubTool,
+    aliasSlug, GalleryItem, HubEvent, HubTool,
     ProviderStatus, ServerRecord, TestResult, uid, WorkflowProfile,
 } from "./types";
 import {jsonSchemaToZodShape} from "./jsonschema";
@@ -45,14 +45,16 @@ export class HubCore {
     gallery: GalleryItem[] = [];
     customProfiles: WorkflowProfile[] = [];
     traffic: { kind: string, detail: string, at: string }[] = [];
-    /** Base URL of the user's local bridge (e.g. http://127.0.0.1:7360), '' if unset. */
-    bridgeBase: string = '';
     /** Probe #2 result: last bot message preview + whether it carried tool-call markup. */
     diagnosticBotContent?: { preview: string; toolish: boolean };
+    /** Base URL of the user's local bridge (e.g. http://127.0.0.1:7360), '' if unset. */
+    bridgeBase: string = '';
 
     private runtimes = new Map<string, Runtime>();
     private listeners = new Set<() => void>();
     private registeredByServer = new Map<string, string[]>();
+    /** Full names we've registered on this.mcp; guards against double-registration. */
+    private registeredNames = new Set<string>();
 
     constructor(private svc: StageServices) {
     }
@@ -121,17 +123,20 @@ export class HubCore {
             this.bridgeBase = '';
             await this.save(SK_BRIDGE, '');
             this.log('info', 'bridge cleared');
+            this.notify();
             return {ok: true};
         }
         // Health-check through the exact path the browser will use.
         const check = await fetch(`${base}/health`).then(r => r.json()).catch(() => null);
         if (!check?.ok) {
-            this.log('error', `bridge check failed — is “npm run bridge” running on ${base}?`);
-            return {ok: false, detail: 'no answer from /health — is the bridge running?'};
+            this.log('error', `bridge check failed - is "npm run bridge" running on ${base}?`);
+            this.notify();
+            return {ok: false, detail: 'no answer from /health - is the bridge running?'};
         }
         this.bridgeBase = base;
         await this.save(SK_BRIDGE, base);
         this.log('info', `bridge connected: ${base}`);
+        this.notify();
         return {ok: true};
     }
 
@@ -158,7 +163,7 @@ export class HubCore {
     async addServer(rec: ServerRecord) {
         this.servers = [...this.servers, rec];
         this.runtimes.set(rec.id, {status: 'offline', tools: []});
-        this.log('server', `added “${rec.alias}” (${rec.kind})`);
+        this.log('server', `added "${rec.alias}" (${rec.kind})`);
         await this.save(SK_SERVERS, this.servers);
         if (rec.enabled) void this.refresh(rec.id);
     }
@@ -178,14 +183,16 @@ export class HubCore {
         this.runtimes.delete(id);
         const name = this.servers.find(s => s.id === id)?.alias;
         this.servers = this.servers.filter(s => s.id !== id);
-        this.log('server', `removed “${name ?? id}”`);
+        this.log('server', `removed "${name ?? id}"`);
         await this.save(SK_SERVERS, this.servers);
+        this.notify();
     }
 
     async setEnabled(id: string, on: boolean) {
         await this.updateServer(id, {enabled: on});
-        if (on) void this.refresh(id);
-        else {
+        if (on) {
+            void this.refresh(id);
+        } else {
             this.unregisterServer(id);
             const rt = this.runtimes.get(id);
             try {
@@ -232,7 +239,7 @@ export class HubCore {
                 if (!t.ok) throw new Error(t.error);
                 this.runtimes.set(id, {status: 'online', tools: [], comfy});
                 this.registerComfyTools(rec);
-                this.log('server', `“${rec.alias}” online (${t.device})`);
+                this.log('server', `"${rec.alias}" online (${t.device})`);
             } else {
                 const client = await this.connectMcp(rec);
                 const list = await (client as any).listTools();
@@ -244,13 +251,13 @@ export class HubCore {
                 }));
                 this.runtimes.set(id, {status: 'online', tools, client});
                 this.registerMcpTools(rec, tools, client);
-                this.log('server', `“${rec.alias}” online — ${tools.length} tool(s): ${tools.map(t => t.name).join(', ').slice(0, 120)}`);
+                this.log('server', `"${rec.alias}" online - ${tools.length} tool(s): ${tools.map(t => t.name).join(', ').slice(0, 120)}`);
             }
             this.setStatus(id, 'online');
         } catch (e: any) {
             const msg = classifyConnectError(e);
             this.setStatus(id, 'error', msg);
-            this.log('error', `“${rec.alias}” failed: ${msg}`);
+            this.log('error', `"${rec.alias}" failed: ${msg}`);
         }
     }
 
@@ -277,7 +284,10 @@ export class HubCore {
                     : base).testConnection();
                 return t.ok ? {ok: true, detail: 'ok', device: t.device} : {ok: false, detail: t.error ?? 'unknown'};
             }
-            const rec = {id: 'test', kind: 'mcp', alias: 'test', enabled: false, url: draft.url ?? '', apiKey: draft.apiKey, useBridge: draft.useBridge} as ServerRecord;
+            const rec = {
+                id: 'test', kind: 'mcp', alias: 'test', enabled: false,
+                url: draft.url ?? '', apiKey: draft.apiKey, useBridge: draft.useBridge,
+            } as ServerRecord;
             const client = await this.connectMcp(rec);
             try {
                 const list = await (client as any).listTools();
@@ -294,22 +304,33 @@ export class HubCore {
     private registerMcpTools(rec: ServerRecord, tools: HubTool[], client: Client) {
         const names: string[] = [];
         for (const tool of tools) {
+            if (this.registeredNames.has(tool.fullName)) {
+                // Already registered earlier this session; its handler resolves the
+                // runtime at call time, so it keeps working after reconnects.
+                names.push(tool.fullName);
+                continue;
+            }
             const shape = jsonSchemaToZodShape(tool.inputSchema);
             const wrappedShape: Record<string, any> = shape ?? {
                 args: z.record(z.any()).describe(
                     'Arguments for this tool as a JSON object. Original schema (truncated): ' +
                     JSON.stringify(tool.inputSchema ?? {}).slice(0, 700)),
             };
-            (this.svc.mcp as any)?.registerTool(
-                tool.fullName,
-                {
-                    title: tool.name,
-                    description: `[${rec.alias}] ${tool.description ?? tool.name}`,
-                    inputSchema: wrappedShape,
-                },
-                async (args: any) => this.callUpstream(rec.id, tool.name, shape == null ? (args?.args ?? args) : args),
-            );
-            names.push(tool.fullName);
+            try {
+                (this.svc.mcp as any)?.registerTool(
+                    tool.fullName,
+                    {
+                        title: tool.name,
+                        description: `[${rec.alias}] ${tool.description ?? tool.name}`,
+                        inputSchema: wrappedShape,
+                    },
+                    async (args: any) => this.callUpstream(rec.id, tool.name, shape == null ? (args?.args ?? args) : args),
+                );
+                this.registeredNames.add(tool.fullName);
+                names.push(tool.fullName);
+            } catch (e: any) {
+                this.log('error', `could not register ${tool.fullName}: ${String(e?.message ?? e).slice(0, 120)}`);
+            }
         }
         this.registeredByServer.set(rec.id, names);
     }
@@ -318,31 +339,45 @@ export class HubCore {
     private registerComfyTools(rec: ServerRecord) {
         const prefix = aliasSlug(rec.alias);
         const gen = `${prefix}__generate_image`;
-        (this.svc.mcp as any)?.registerTool(
-            gen,
-            {
-                title: 'Generate image (ComfyUI)',
-                description: `[${rec.alias}] Generate an image with the user's local ComfyUI and return it as a markdown image for the chat. Use to visually render scenes, characters, outfits, items, or locations when the user asks for a picture (or offers clear visual intent).`,
-                inputSchema: {
-                    prompt: z.string().describe('Detailed image description (tags or natural language both fine)'),
-                    negative: z.string().optional().describe('What to avoid'),
-                    aspect: z.enum(['1:1', '3:2', '2:3']).optional().describe('Image aspect ratio'),
-                    seed: z.number().optional().describe('Fixed seed for reproducibility'),
-                },
-                annotations: {readOnlyHint: false, openWorldHint: true, destructiveHint: false},
-            },
-            async (args: any) => this.callComfy(rec.id, args),
-        );
+        if (!this.registeredNames.has(gen)) {
+            try {
+                (this.svc.mcp as any)?.registerTool(
+                    gen,
+                    {
+                        title: 'Generate image (ComfyUI)',
+                        description: `[${rec.alias}] Generate an image with the user's local ComfyUI and return it as a markdown image for the chat. Use to visually render scenes, characters, outfits, items, or locations when the user asks for a picture (or offers clear visual intent).`,
+                        inputSchema: {
+                            prompt: z.string().describe('Detailed image description (tags or natural language both fine)'),
+                            negative: z.string().optional().describe('What to avoid'),
+                            aspect: z.enum(['1:1', '3:2', '2:3']).optional().describe('Image aspect ratio'),
+                            seed: z.number().optional().describe('Fixed seed for reproducibility'),
+                        },
+                        annotations: {readOnlyHint: false, openWorldHint: true, destructiveHint: false},
+                    },
+                    async (args: any) => this.callComfy(rec.id, args),
+                );
+                this.registeredNames.add(gen);
+            } catch (e: any) {
+                this.log('error', `could not register ${gen}: ${String(e?.message ?? e).slice(0, 120)}`);
+            }
+        }
         this.registeredByServer.set(rec.id, [gen]);
     }
 
     private unregisterServer(id: string) {
         const names = this.registeredByServer.get(id) ?? [];
+        const mcp: any = this.svc.mcp;
         for (const name of names) {
             try {
-                const mcp: any = this.svc.mcp;
                 if (mcp && typeof mcp.unregisterTool === 'function') mcp.unregisterTool(name);
                 else if (mcp && typeof mcp.removeTool === 'function') mcp.removeTool(name);
+                // SDK has no public unregister: reach into the internal registry.
+                const internal = mcp?._registeredTools;
+                if (internal instanceof Map) internal.delete(name);
+                const gone = !(mcp?._registeredTools instanceof Map && mcp._registeredTools.has(name));
+                if (gone) this.registeredNames.delete(name);
+                // If it couldn't be removed, keep it in registeredNames - the
+                // guard in the register path will skip re-registering it.
             } catch { /* ignore */ }
         }
         this.registeredByServer.delete(id);
@@ -352,15 +387,15 @@ export class HubCore {
 
     private async callUpstream(serverId: string, toolName: string, args: any): Promise<any> {
         const rec = this.servers.find(s => s.id === serverId);
-        if (!rec?.enabled) return {isError: true, content: [{type: 'text', text: `server “${rec?.alias ?? '?'}” is disabled.`}]};
+        if (!rec?.enabled) return {isError: true, content: [{type: 'text', text: `server "${rec?.alias ?? '?'}" is disabled.`}]};
         const rt = this.runtimes.get(serverId);
         if (rt?.status !== 'online' || !rt.client) {
-            return {isError: true, content: [{type: 'text', text: `server “${rec.alias}” is offline (${rt?.error ?? 'not connected'}).`}]};
+            return {isError: true, content: [{type: 'text', text: `server "${rec.alias}" is offline (${rt?.error ?? 'not connected'}).`}]};
         }
         try {
             const result = await (rt.client as any).callTool({name: toolName, arguments: args ?? {}}, undefined, {timeout: 120_000});
             const processed = await this.materializeImages(result?.content, serverId);
-            this.log('tool', `${rec.alias}.${toolName} ← ok`);
+            this.log('tool', `${rec.alias}.${toolName} <- ok`);
             return {...result, content: processed};
         } catch (e: any) {
             this.log('error', `${rec.alias}.${toolName} failed: ${String(e?.message ?? e).slice(0, 160)}`);
@@ -373,11 +408,11 @@ export class HubCore {
         if (!rec?.enabled) return {isError: true, content: [{type: 'text', text: `comfy server disabled.`}]};
         const rt = this.runtimes.get(serverId);
         if (rt?.status !== 'online' || !rt.comfy) {
-            return {isError: true, content: [{type: 'text', text: `ComfyUI (${rec?.alias}) is offline: ${rt?.error ?? 'not connected'}. Check it's running with --enable-cors-header and press the refresh/test in the hub panel.`}]};
+            return {isError: true, content: [{type: 'text', text: `ComfyUI (${rec?.alias}) is offline: ${rt?.error ?? 'not connected'}. Enable "route via bridge" in the hub panel if the browser blocks it.`}]};
         }
         const profile = this.getProfiles().find(p => p.id === rec.profileId) ?? BUILTIN_PROFILES[0];
         const {w, h} = aspectToDims(args?.aspect);
-        this.log('tool', `${rec.alias} generating: “${String(args?.prompt ?? '').slice(0, 80)}…” (profile ${profile.name})`);
+        this.log('tool', `${rec.alias} generating: "${String(args?.prompt ?? '').slice(0, 80)}" (profile ${profile.name})`);
         try {
             const res: { bytes: Blob; filename: string; seed: number } = await rt.comfy.generate(profile, {
                 prompt: String(args?.prompt ?? ''),
@@ -391,11 +426,11 @@ export class HubCore {
             const item: GalleryItem = {url, prompt: String(args?.prompt ?? ''), at: new Date().toISOString()};
             this.gallery = [item, ...this.gallery].slice(0, 60);
             void this.save(SK_GALLERY, this.gallery);
-            this.log('image', `${rec.alias} → image ready (${res.filename}, seed ${res.seed})`);
+            this.log('image', `${rec.alias} -> image ready (${res.filename}, seed ${res.seed})`);
             return {
                 content: [
                     {type: 'text', text: `![${String(args?.prompt ?? 'generated image').slice(0, 220)}](${url})`},
-                    {type: 'text', text: `(generated with ComfyUI · profile “${profile.name}” · seed ${res.seed})`},
+                    {type: 'text', text: `(generated with ComfyUI - profile "${profile.name}" - seed ${res.seed})`},
                 ],
             };
         } catch (e: any) {
@@ -430,7 +465,7 @@ export class HubCore {
                     this.gallery = [{url, prompt: `${this.aliasOf(serverId)} image`, at: new Date().toISOString()}, ...this.gallery].slice(0, 60);
                     void this.save(SK_GALLERY, this.gallery);
                     out.push({type: 'text', text: `![image](${url})`});
-                    this.log('image', `${this.aliasOf(serverId)} returned an image → CDN`);
+                    this.log('image', `${this.aliasOf(serverId)} returned an image -> CDN`);
                 } catch {
                     out.push(item);
                 }
@@ -473,7 +508,7 @@ export class HubCore {
                 speaker_id: this.svc.userId,
                 message: '![mcp-access-probe](https://picsum.photos/seed/mcpaccess/640/360)',
             });
-            this.log('info', 'markdown-image probe sent to chat — look for a rendered image in the log');
+            this.log('info', 'markdown-image probe sent to chat - look for a rendered image in the log');
         } catch (e: any) {
             this.log('error', `probe failed: ${String(e?.message ?? e)}`);
         }
@@ -486,7 +521,7 @@ function classifyConnectError(e: any): string {
     const msg = String(e?.message ?? e);
     if (e?.name === 'AbortError') return 'timed out';
     if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) {
-        return 'blocked by browser/network (CORS or PNA). Start the local bridge (`npm run bridge`) and enable “route via bridge” for this server.';
+        return 'blocked by browser/network (CORS or PNA). Start the local bridge (`npm run bridge`) and enable "route via bridge" for this server.';
     }
     return msg.slice(0, 220);
 }

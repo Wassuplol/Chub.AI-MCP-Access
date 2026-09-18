@@ -36,7 +36,7 @@ export class Stage extends StageBase<any, any, any, any> {
             'hub__status',
             {
                 title: 'MCP Access status',
-                description: 'Report which MCP Access servers are connected and how many tools are available. Call when unsure whether tools are wired up.',
+                description: 'Internal hub diagnostics ONLY. Do not use this to answer the user. Call exclusively if the user explicitly asks about tool/server/hub status.',
                 inputSchema: {},
             },
             async () => {
