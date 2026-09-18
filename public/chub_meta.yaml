@@ -1,8 +1,8 @@
 # Metadata for this stage. All fields optional.
 extension_id: 'mcp-spike-1e439bc9e95f'
 github_path: 'https://github.com/Wassuplol/Chub.AI-MCP-Access'
-project_name: "MCP Spike"
-tagline: "Probing whether stage-registered MCP tools reach the chat model."
+project_name: "MCP Access"
+tagline: "Plug any character into any MCP server — web search, ComfyUI images, your own tools."
 visibility: 'PRIVATE'
 position: 'ADJACENT'
 tags:

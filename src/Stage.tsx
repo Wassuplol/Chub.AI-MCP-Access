@@ -1,77 +1,60 @@
-import {CSSProperties, ReactElement, useEffect, useState} from "react";
-import {Character, InitialData, Message, StageBase, StageResponse, LoadResponse, User} from "@chub-ai/stages-ts";
-import {z} from "zod";
+import {ReactElement} from "react";
+import {InitialData, Message, StageBase, StageResponse, LoadResponse} from "@chub-ai/stages-ts";
+import {HubCore} from "./hub/core";
+import {HubRoot} from "./ui/HubRoot";
 
 /***
- MCP SPIKE STAGE
- ===============
- Purpose: verify the native MCP path. Every stage instance gets an
- `McpServer` at `this.mcp`. In production/staging, ReactRunner connects it
- to the Chub host via IframeServerTransport right after load().
- Anything registered here SHOULD become visible to the host (and model).
-
- This stage registers four test tools and logs every invocation so we can
- prove from the stage's own UI that a tool call actually happened.
+ MCP ACCESS
+ ==========
+ One stage = a personal MCP hub. The user registers upstream MCP servers
+ (Tavily, ComfyUI via native API, any custom Streamable-HTTP server);
+ the hub projects their tools onto this.mcp, which the Chub host consumes
+ as native model tools.
  ***/
+export class Stage extends StageBase<any, any, any, any> {
 
-export type ToolCallRecord = {
-    tool: string;
-    args: Record<string, any>;
-    resultPreview: string;
-    at: string;
-};
+    hub: HubCore;
+    environmentName: string;
 
-export type TrafficRecord = {
-    kind: string;
-    detail: string;
-    at: string;
-};
-
-type MessageStateType = { calls: ToolCallRecord[] };
-type ChatStateType = { totalCalls: number };
-type ConfigType = { echoPrefix?: string };
-
-export class Stage extends StageBase<any, ChatStateType, MessageStateType, ConfigType> {
-
-    calls: ToolCallRecord[];
-    notes: string[] = [];
-    traffic: TrafficRecord[] = [];
-    environment: string = 'unknown';
-    configPrefix: string;
-    private rosterCharacters: { [key: string]: Character } = {};
-    private rosterUsers: { [key: string]: User } = {};
-    private readonly listeners = new Set<() => void>();
-    private tick = 0;
-
-    constructor(data: InitialData<any, ChatStateType, MessageStateType, ConfigType>) {
+    constructor(data: InitialData<any, any, any, any>) {
         super(data);
-        const {characters, users, config, messageState, environment} = data;
-
-        this.rosterCharacters = characters ?? {};
-        this.rosterUsers = users ?? {};
-        this.calls = messageState?.calls ?? [];
-        this.configPrefix = (config as ConfigType | null)?.echoPrefix ?? 'stage says';
-        this.environment = String(environment);
-
-        this.watchHostTraffic();
-        this.registerTools();
-
-        // Exposed on the instance: also callable via the host's CALL
-        // postMessage path (`StageFunctionCall` type).
-        (this as any).mcpSpikeStats = () => ({
-            calls: this.calls.length,
-            notes: this.notes.length,
-            characters: Object.keys(characters).length,
-            users: Object.keys(users).length,
-            environment,
+        this.environmentName = String(data.environment);
+        this.hub = new HubCore({
+            mcp: this.mcp,
+            storage: this.storage,
+            messenger: this.messenger,
+            userId: data.userId,
+            environment: this.environmentName,
         });
+        this.watchHostTraffic();
+        this.registerOwnTools();
     }
 
-    /***
-     Passive observer: logs every message the host page posts into this iframe.
-     Completely read-only -- proves whether the host ever attempts an MCP
-     handshake (initialize / tools/list), independent of the model's behavior.
-     ***/
+    /** The hub's own always-on meta tool. */
+    private registerOwnTools() {
+        (this.mcp as any).registerTool(
+            'hub__status',
+            {
+                title: 'MCP Access status',
+                description: 'Report which MCP Access servers are connected and how many tools are available. Call when unsure whether tools are wired up.',
+                inputSchema: {},
+            },
+            async () => {
+                const online = this.hub.servers.filter(s => s.enabled && this.hub.runtimeOf(s.id).status === 'online');
+                const toolCount = this.hub.servers.reduce((n, s) => n + (this.hub.runtimeOf(s.id).tools?.length ?? 0), 0);
+                const comfy = this.hub.servers.filter(s => s.enabled && s.kind === 'comfy' && this.hub.runtimeOf(s.id).status === 'online').length;
+                return {
+                    content: [{
+                        type: 'text',
+                        text: `MCP Access: ${online.length}/${this.hub.servers.length} servers online (${online.map(s => s.alias).join(', ') || 'none'}); ` +
+                            `${toolCount} upstream tool(s) + ${comfy} image connector(s).`,
+                    }],
+                };
+            },
+        );
+    }
+
+    /** Passive observer: logs host postMessage traffic into the diagnostics drawer. */
     private watchHostTraffic() {
         if (typeof window === 'undefined' || window.parent === window) return;
         window.addEventListener('message', (event) => {
@@ -81,219 +64,46 @@ export class Stage extends StageBase<any, ChatStateType, MessageStateType, Confi
                 if (d.type === 'mcp-message' && d.payload != null) {
                     const msgs = Array.isArray(d.payload) ? d.payload : [d.payload];
                     for (const m of msgs) {
-                        this.logTraffic('MCP', (m as any)?.method ?? 'response/id:' + ((m as any)?.id ?? '?'));
+                        this.hub.logTraffic('MCP', (m as any)?.method ?? 'response/id:' + ((m as any)?.id ?? '?'));
                     }
                 } else if (typeof d.type === 'string' && d.type.startsWith('iframe-')) {
-                    this.logTraffic('HOST', d.type);
+                    this.hub.logTraffic('HOST', d.type);
                 } else if (typeof d.messageType === 'string') {
-                    this.logTraffic('HOST', d.messageType);
+                    this.hub.logTraffic('HOST', d.messageType);
                 }
             } catch { /* observer must never throw */ }
         });
     }
 
-    private logTraffic(kind: string, detail: string) {
-        this.traffic = [...this.traffic.slice(-49), {kind, detail, at: new Date().toISOString()}];
-        this.notify();
+    async load(): Promise<Partial<LoadResponse<any, any, any>>> {
+        await this.hub.load();
+        return {success: true, error: null, initState: null, chatState: null};
     }
 
-    private record(tool: string, args: Record<string, any>, result: string) {
-        this.calls = [...this.calls, {tool, args, resultPreview: result.slice(0, 300), at: new Date().toISOString()}];
-        this.notify();
+    async setState(_state: any): Promise<void> {
+        // Hub state is persisted through stage storage, not per-message state.
     }
 
-    private registerTools() {
-        const text = (message: string) => ({content: [{type: 'text' as const, text: message}]});
-        // registerTool's generics explode (TS2589) when called on the typed
-        // McpServer field with this zod/sdk combo; cast once, keep handlers sane.
-        const register = (name: string, config: Record<string, any>, handler: (args: any) => any) =>
-            (this.mcp as any).registerTool(name, config, handler);
-
-        register(
-            'stage_ping',
-            {
-                title: 'Stage Ping',
-                description: 'Ping the stage currently running inside this chat. Useful to verify the stage and its tools are alive. Cheap to call; call it whenever unsure whether stage tools work.',
-                inputSchema: {message: z.string().optional().describe('Optional word to echo back')},
-                annotations: {readOnlyHint: true, destructiveHint: false, openWorldHint: false},
-            },
-            async ({message}) => {
-                const result = `${this.configPrefix}: pong${message ? ` (${message})` : ''}`;
-                this.record('stage_ping', {message: message ?? null}, result);
-                return text(result);
-            },
-        );
-
-        register(
-            'current_time',
-            {
-                title: 'Current Time',
-                description: 'Get the current date and time (ISO 8601) from the stage environment.',
-                inputSchema: {},
-                annotations: {readOnlyHint: true, destructiveHint: false, openWorldHint: false},
-            },
-            async () => {
-                const result = new Date().toISOString();
-                this.record('current_time', {}, result);
-                return text(result);
-            },
-        );
-
-        register(
-            'chat_roster',
-            {
-                title: 'Chat Roster',
-                description: 'List the characters and users present in this chat as the stage sees them.',
-                inputSchema: {},
-                annotations: {readOnlyHint: true, destructiveHint: false, openWorldHint: false},
-            },
-            async () => {
-                const chars = this.rosterCharacters;
-                const users = this.rosterUsers;
-                const names = [
-                    ...Object.values(users).map(u => `${u.name || 'unnamed user'} (user)`),
-                    ...Object.values(chars).map(c => `${c.name || 'unnamed character'} (character${c.isRemoved ? ', removed' : ''})`),
-                ];
-                const result = names.length > 0 ? names.join('\n') : 'nobody here';
-                this.record('chat_roster', {}, result);
-                return text(result);
-            },
-        );
-
-        register(
-            'stage_note',
-            {
-                title: 'Stage Note',
-                description: 'Leave a short note on the stage panel. Visible to the human in the stage UI until the page reloads.',
-                inputSchema: {text: z.string().max(280).describe('The note text')},
-                annotations: {readOnlyHint: false, destructiveHint: false, openWorldHint: false},
-            },
-            async ({text: noteText}) => {
-                this.notes = [...this.notes, noteText];
-                const result = `note recorded (${this.notes.length} total)`;
-                this.record('stage_note', {text: noteText}, result);
-                return text(result);
-            },
-        );
+    async beforePrompt(_userMessage: Message): Promise<Partial<StageResponse<any, any>>> {
+        return {};
     }
 
-    addListener(cb: () => void) {
-        this.listeners.add(cb);
-    }
-
-    removeListener(cb: () => void) {
-        this.listeners.delete(cb);
-    }
-
-    private notify() {
-        this.tick += 1;
-        this.listeners.forEach(cb => cb());
-    }
-
-    async load(): Promise<Partial<LoadResponse<any, ChatStateType, MessageStateType>>> {
-        return {
-            success: true,
-            error: null,
-            initState: null,
-            chatState: {totalCalls: this.calls.length},
-        };
-    }
-
-    async setState(state: MessageStateType): Promise<void> {
-        if (state != null) {
-            this.calls = state.calls ?? [];
-            this.notify();
-        }
-    }
-
-    async beforePrompt(_userMessage: Message): Promise<Partial<StageResponse<ChatStateType, MessageStateType>>> {
-        return {
-            messageState: {calls: this.calls},
-            chatState: {totalCalls: this.calls.length},
-        };
-    }
-
-    async afterResponse(_botMessage: Message): Promise<Partial<StageResponse<ChatStateType, MessageStateType>>> {
-        return {
-            messageState: {calls: this.calls},
-            chatState: {totalCalls: this.calls.length},
-        };
+    async afterResponse(botMessage: Message): Promise<Partial<StageResponse<any, any>>> {
+        // Probe #2: is the host's tool-call markup embedded in the message content?
+        // If yes, we could strip it via modifiedMessage; if no, it's renderer-side.
+        try {
+            const content = botMessage?.content ?? '';
+            const looksToolish = /<tool|tool_call|tools\/call|\"name\":\s*\"[\w-]+__/i.test(content);
+            this.hub.diagnosticBotContent = {
+                preview: content.slice(0, 160),
+                toolish: looksToolish,
+            };
+            this.hub.notify();
+        } catch { /* diagnostics must never throw */ }
+        return {};
     }
 
     render(): ReactElement {
-        return <SpikePanel stage={this}/>;
+        return <HubRoot hub={this.hub} environment={this.environmentName}/>;
     }
-}
-
-function SpikePanel({stage}: { stage: Stage }) {
-    const [, setTick] = useState(0);
-    useEffect(() => {
-        const cb = () => setTick(t => t + 1);
-        stage.addListener(cb);
-        return () => stage.removeListener(cb);
-    }, [stage]);
-
-    const mono: CSSProperties = {fontFamily: 'ui-monospace, Consolas, monospace'};
-
-    return <div style={{
-        ...mono,
-        height: '100%',
-        maxHeight: '100vh',
-        overflowY: 'auto',
-        background: 'rgba(12, 14, 20, 0.92)',
-        color: '#d6e4ff',
-        padding: '10px',
-        fontSize: '12px',
-        boxSizing: 'border-box',
-    }}>
-        <div style={{fontSize: '14px', fontWeight: 700, marginBottom: 6}}>MCP Spike</div>
-        <div style={{opacity: 0.8, marginBottom: 10}}>
-            4 tools registered on this.mcp. If the host consumes the stage MCP server, the model can call these.
-            Every invocation is logged below.
-        </div>
-        <div style={{marginBottom: 8}}>
-            <b>Environment:</b> {stage.environment}
-        </div>
-        <div style={{marginBottom: 8}}>
-            <b>Registered:</b> stage_ping · current_time · chat_roster · stage_note
-        </div>
-        <div style={{marginBottom: 8}}>
-            <b>Calls observed by stage:</b> {stage.calls.length}
-        </div>
-        <div style={{marginBottom: 8}}>
-            <b>Host traffic into iframe</b> <span style={{opacity: 0.6}}>(INIT/BEFORE/AFTER = chat lifecycle · MCP initialize/tools-* = MCP session)</span>:
-            {stage.traffic.length === 0 && <div style={{opacity: 0.6}}>none observed</div>}
-            {stage.traffic.length > 0 && <div style={{
-                maxHeight: 140, overflowY: 'auto', marginTop: 4,
-                border: '1px solid rgba(120,160,255,0.18)', borderRadius: 6, padding: '4px 6px'
-            }}>
-                {[...stage.traffic].reverse().map((t, i) => (
-                    <div key={i} style={{opacity: 0.75}}>
-                        {t.at.slice(11, 19)} <b>{t.kind}</b> {t.detail}
-                    </div>
-                ))}
-            </div>}
-        </div>
-        {stage.notes.length > 0 && <div style={{marginBottom: 8}}>
-            <b>Notes from the model:</b>
-            <ul style={{margin: '4px 0', paddingLeft: 16}}>
-                {stage.notes.map((n, i) => <li key={i}>{n}</li>)}
-            </ul>
-        </div>}
-        {stage.calls.length > 0 && <div>
-            <b>Call log:</b>
-            {stage.calls.map((c, i) => (
-                <div key={i} style={{
-                    border: '1px solid rgba(120, 160, 255, 0.25)',
-                    borderRadius: 6,
-                    padding: '4px 6px',
-                    marginTop: 6
-                }}>
-                    <div><b>{c.tool}</b> <span style={{opacity: 0.6}}>{c.at}</span></div>
-                    <div style={{opacity: 0.85}}>args: {JSON.stringify(c.args)}</div>
-                    <div style={{opacity: 0.85}}>result: {c.resultPreview}</div>
-                </div>
-            ))}
-        </div>}
-    </div>;
 }
