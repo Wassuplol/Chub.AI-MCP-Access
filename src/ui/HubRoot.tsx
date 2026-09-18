@@ -20,6 +20,8 @@ export function HubRoot({hub, environment}: { hub: HubCore; environment: string 
     const [showAdd, setShowAdd] = useState(false);
     const [showDiag, setShowDiag] = useState(false);
     const [probeNote, setProbeNote] = useState('');
+    const [bridgeUrl, setBridgeUrl] = useState(hub.bridgeBase);
+    const [bridgeMsg, setBridgeMsg] = useState('');
 
     useEffect(() => hub.subscribe(() => setTick(t => t + 1)), [hub]);
 
@@ -98,7 +100,20 @@ export function HubRoot({hub, environment}: { hub: HubCore; environment: string 
                     onClick={() => setShowDiag(v => !v)}>
                 {showDiag ? '▾' : '▸'} Diagnostics <span style={{color: palette.dim}}>({environment})</span>
             </button>
-            {showDiag && <div className="mcp-card mcp-fade" style={{marginTop: 6, padding: '10px', maxHeight: 260, overflowY: 'auto'}}>
+            {showDiag && <div className="mcp-card mcp-fade" style={{marginTop: 6, padding: '10px', maxHeight: 300, overflowY: 'auto'}}>
+                <div style={{fontSize: 10.5, color: palette.dim, marginBottom: 6}}>Local bridge — run <code style={{color: palette.accent}}>npm run bridge</code> in the project folder, then set the base URL here to unlock CORS-blocked servers (Tavily MCP, ComfyUI without flags, Qdrant, Ollama…):</div>
+                <div style={{display: 'flex', gap: 6, marginBottom: 4}}>
+                    <input className="mcp-input" style={{flex: 1}} value={bridgeUrl}
+                           onChange={e => setBridgeUrl(e.target.value)}
+                           placeholder="http://127.0.0.1:7360"/>
+                    <button className="mcp-btn mcp-btn-ghost" onClick={async () => {
+                        const r = await hub.setBridgeBase(bridgeUrl);
+                        setBridgeMsg(r.ok ? (hub.bridgeBase ? '✓ bridge connected' : '✓ bridge cleared') : `✗ ${r.detail}`);
+                    }}>Save</button>
+                </div>
+                <div style={{fontSize: 11, marginBottom: 8, color: bridgeMsg.startsWith('✗') ? palette.bad : palette.good}}>
+                    {bridgeMsg || (hub.bridgeBase ? `active: ${hub.bridgeBase}` : 'inactive')}
+                </div>
                 {hub.diagnosticBotContent && (
                     <div style={{fontSize: 10.5, color: palette.dim, marginBottom: 8, borderBottom: `1px solid ${palette.border}`, paddingBottom: 6}}>
                         tool-card probe: last bot message {hub.diagnosticBotContent.toolish

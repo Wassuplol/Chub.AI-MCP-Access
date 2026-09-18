@@ -19,6 +19,7 @@ import {BUILTIN_PROFILES, ComfyClient, isValidWorkflow} from "./comfy";
 const SK_SERVERS = 'hub_servers';
 const SK_PROFILES = 'hub_profiles_custom';
 const SK_GALLERY = 'hub_gallery';
+const SK_BRIDGE = 'hub_bridge_base';
 
 const EVENT_KEEP = 120;
 
@@ -44,6 +45,8 @@ export class HubCore {
     gallery: GalleryItem[] = [];
     customProfiles: WorkflowProfile[] = [];
     traffic: { kind: string, detail: string, at: string }[] = [];
+    /** Base URL of the user's local bridge (e.g. http://127.0.0.1:7360), '' if unset. */
+    bridgeBase: string = '';
     /** Probe #2 result: last bot message preview + whether it carried tool-call markup. */
     diagnosticBotContent?: { preview: string; toolish: boolean };
 
@@ -102,13 +105,52 @@ export class HubCore {
         this.servers = await this.loadKey<ServerRecord[]>(SK_SERVERS) ?? [];
         this.customProfiles = await this.loadKey<WorkflowProfile[]>(SK_PROFILES) ?? [];
         this.gallery = (await this.loadKey<GalleryItem[]>(SK_GALLERY)) ?? [];
+        this.bridgeBase = (await this.loadKey<string>(SK_BRIDGE)) ?? '';
         for (const srv of this.servers) {
             this.runtimes.set(srv.id, {status: 'offline', tools: []});
         }
-        this.log('info', `hub loaded: ${this.servers.length} server(s)`);
+        this.log('info', `hub loaded: ${this.servers.length} server(s)${this.bridgeBase ? ' · bridge on' : ''}`);
         for (const srv of this.servers) {
             if (srv.enabled) void this.refresh(srv.id);
         }
+    }
+
+    async setBridgeBase(url: string): Promise<{ ok: boolean; detail?: string }> {
+        const base = url.trim().replace(/\/+$/, '');
+        if (!base) {
+            this.bridgeBase = '';
+            await this.save(SK_BRIDGE, '');
+            this.log('info', 'bridge cleared');
+            return {ok: true};
+        }
+        // Health-check through the exact path the browser will use.
+        const check = await fetch(`${base}/health`).then(r => r.json()).catch(() => null);
+        if (!check?.ok) {
+            this.log('error', `bridge check failed — is “npm run bridge” running on ${base}?`);
+            return {ok: false, detail: 'no answer from /health — is the bridge running?'};
+        }
+        this.bridgeBase = base;
+        await this.save(SK_BRIDGE, base);
+        this.log('info', `bridge connected: ${base}`);
+        return {ok: true};
+    }
+
+    /** Effective MCP endpoint URL for a record (API key + optional bridge wrap). */
+    private resolveMcpUrl(rec: ServerRecord): string {
+        let url = withUrlKey(rec.url, rec);
+        if (rec.useBridge && this.bridgeBase) {
+            url = `${this.bridgeBase}/cors/${encodeURIComponent(url)}`;
+        }
+        return url;
+    }
+
+    /** Effective ComfyUI base for a record (optional bridge wrap). */
+    private resolveComfyBase(rec: ServerRecord): string {
+        const base = rec.url.replace(/\/+$/, '');
+        if (rec.useBridge && this.bridgeBase) {
+            return `${this.bridgeBase}/corsbase/${encodeURIComponent(base)}`;
+        }
+        return base;
     }
 
     /* ---------------------------------------------------------- registry */
@@ -185,7 +227,7 @@ export class HubCore {
         this.setStatus(id, 'connecting');
         try {
             if (rec.kind === 'comfy') {
-                const comfy = new ComfyClient(rec.url);
+                const comfy = new ComfyClient(this.resolveComfyBase(rec));
                 const t = await comfy.testConnection();
                 if (!t.ok) throw new Error(t.error);
                 this.runtimes.set(id, {status: 'online', tools: [], comfy});
@@ -213,7 +255,7 @@ export class HubCore {
     }
 
     private async connectMcp(rec: ServerRecord): Promise<Client> {
-        const url = withUrlKey(rec.url, rec);
+        const url = this.resolveMcpUrl(rec);
         const headers: Record<string, string> = {};
         if (rec.apiKey && !withUrlKeyUsed(rec)) headers['Authorization'] = `Bearer ${rec.apiKey}`;
         const transport = new StreamableHTTPClientTransport(new URL(url), {
@@ -228,10 +270,14 @@ export class HubCore {
     async testServer(draft: Partial<ServerRecord>): Promise<TestResult> {
         try {
             if (draft.kind === 'comfy') {
-                const t = await new ComfyClient(draft.url ?? '').testConnection();
+                const base = draft.url ?? '';
+                const useBridge = draft.useBridge && this.bridgeBase;
+                const t = await new ComfyClient(useBridge
+                    ? `${this.bridgeBase}/corsbase/${encodeURIComponent(base.replace(/\/+$/, ''))}`
+                    : base).testConnection();
                 return t.ok ? {ok: true, detail: 'ok', device: t.device} : {ok: false, detail: t.error ?? 'unknown'};
             }
-            const rec = {id: 'test', kind: 'mcp', alias: 'test', enabled: false, url: draft.url ?? '', apiKey: draft.apiKey} as ServerRecord;
+            const rec = {id: 'test', kind: 'mcp', alias: 'test', enabled: false, url: draft.url ?? '', apiKey: draft.apiKey, useBridge: draft.useBridge} as ServerRecord;
             const client = await this.connectMcp(rec);
             try {
                 const list = await (client as any).listTools();
@@ -440,7 +486,7 @@ function classifyConnectError(e: any): string {
     const msg = String(e?.message ?? e);
     if (e?.name === 'AbortError') return 'timed out';
     if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) {
-        return 'blocked by browser/network (CORS or offline). Self-hosted servers need CORS+PNA headers; see hub docs.';
+        return 'blocked by browser/network (CORS or PNA). Start the local bridge (`npm run bridge`) and enable “route via bridge” for this server.';
     }
     return msg.slice(0, 220);
 }

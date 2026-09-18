@@ -14,6 +14,7 @@ export function ServerCard({hub, rec}: { hub: HubCore; rec: ServerRecord }) {
     const [editKey, setEditKey] = useState(rec.apiKey ?? '');
     const [editAlias, setEditAlias] = useState(rec.alias);
     const [editCheckpoint, setEditCheckpoint] = useState(rec.checkpoint ?? '');
+    const [editUseBridge, setEditUseBridge] = useState(!!rec.useBridge);
     const [uploadMsg, setUploadMsg] = useState('');
     const fileRef = useRef<HTMLInputElement>(null);
 
@@ -23,7 +24,7 @@ export function ServerCard({hub, rec}: { hub: HubCore; rec: ServerRecord }) {
     const doTest = async () => {
         setTesting(true);
         setTestResult(null);
-        const r = await hub.testServer({kind: rec.kind, url: editUrl, apiKey: editKey || undefined});
+        const r = await hub.testServer({kind: rec.kind, url: editUrl, apiKey: editKey || undefined, useBridge: editUseBridge});
         setTestResult(r);
         setTesting(false);
     };
@@ -34,6 +35,7 @@ export function ServerCard({hub, rec}: { hub: HubCore; rec: ServerRecord }) {
             apiKey: editKey.trim() || undefined,
             alias: editAlias.trim() || rec.alias,
             checkpoint: editCheckpoint.trim() || undefined,
+            useBridge: editUseBridge,
         });
         if (rec.enabled) void hub.refresh(rec.id);
     };
@@ -94,6 +96,13 @@ export function ServerCard({hub, rec}: { hub: HubCore; rec: ServerRecord }) {
             {!isComfy && <Field label="API key (optional — stored in your stage storage, never sent to the model)">
                 <input className="mcp-input" type="password" value={editKey} onChange={e => setEditKey(e.target.value)} placeholder="••••••"/>
             </Field>}
+
+            <div style={{display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10}}>
+                <Toggle on={editUseBridge} onClick={() => setEditUseBridge(v => !v)}/>
+                <div style={{fontSize: 11.5, color: palette.dim}}>
+                    Route via local bridge {hub.bridgeBase ? '' : '(set bridge URL in Diagnostics)'}
+                </div>
+            </div>
 
             {isComfy && <>
                 <Field label="Workflow profile">

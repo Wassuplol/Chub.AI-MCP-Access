@@ -2,7 +2,7 @@ import {useState} from "react";
 import {HubCore} from "../hub/core";
 import {ServerRecord, TestResult, uid} from "../hub/types";
 import {palette} from "./styles";
-import {Btn, Field} from "./primitives";
+import {Btn, Field, Toggle} from "./primitives";
 
 type Preset = 'custom' | 'tavily' | 'comfy';
 
@@ -19,6 +19,7 @@ export function AddServerModal({hub, onClose}: { hub: HubCore; onClose: () => vo
     const [apiKey, setApiKey] = useState('');
     const [testing, setTesting] = useState(false);
     const [testResult, setTestResult] = useState<TestResult | null>(null);
+    const [useBridge, setUseBridge] = useState(!!hub.bridgeBase);
 
     const pick = (p: Preset) => {
         setPreset(p);
@@ -40,7 +41,7 @@ export function AddServerModal({hub, onClose}: { hub: HubCore; onClose: () => vo
     const test = async () => {
         setTesting(true);
         setTestResult(null);
-        const r = await hub.testServer({kind, url, apiKey: apiKey || undefined});
+        const r = await hub.testServer({kind, url, apiKey: apiKey || undefined, useBridge});
         setTestResult(r);
         setTesting(false);
     };
@@ -53,6 +54,7 @@ export function AddServerModal({hub, onClose}: { hub: HubCore; onClose: () => vo
             enabled: true,
             url: url.trim(),
             apiKey: apiKey.trim() || undefined,
+            useBridge,
         };
         onClose();
         await hub.addServer(rec);
@@ -103,6 +105,16 @@ export function AddServerModal({hub, onClose}: { hub: HubCore; onClose: () => vo
                            hint="Stored in your stage storage only. Never sent to the model.">
                         <input className="mcp-input" type="password" value={apiKey} onChange={e => setApiKey(e.target.value)}/>
                     </Field>}
+
+                <div style={{display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12}}>
+                    <Toggle on={useBridge} onClick={() => setUseBridge(v => !v)}/>
+                    <div style={{fontSize: 11.5, color: palette.dim}}>
+                        Route via local bridge
+                        <span style={{display: 'block', fontSize: 10.5, opacity: .8}}>
+                            Fixes browser CORS/PNA blocks — requires <code style={{color: palette.accent}}>npm run bridge</code> running{!hub.bridgeBase ? ' (set its URL in Diagnostics first)' : ''}
+                        </span>
+                    </div>
+                </div>
 
                 {testResult && <div className="mcp-fade" style={{
                     marginBottom: 10, fontSize: 12,

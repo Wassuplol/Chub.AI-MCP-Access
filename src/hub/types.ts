@@ -25,6 +25,8 @@ export interface ServerRecord {
     profileId?: string;
     /** ComfyUI: explicit checkpoint override; otherwise the first available is used. */
     checkpoint?: string;
+    /** Route through the user's local bridge (npm run bridge) — fixes CORS/PNA. */
+    useBridge?: boolean;
 }
 
 export type ProviderStatus = 'offline' | 'connecting' | 'online' | 'error';
