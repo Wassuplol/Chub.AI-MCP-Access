@@ -25,6 +25,8 @@ export class Stage extends StageBase<any, any, any, any> {
             messenger: this.messenger,
             userId: data.userId,
             environment: this.environmentName,
+            id: data.id,
+            token: data.token,
         });
         this.watchHostTraffic();
         this.registerOwnTools();

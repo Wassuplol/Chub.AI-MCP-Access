@@ -15,6 +15,7 @@ import {
 } from "./types";
 import {jsonSchemaToZodShape} from "./jsonschema";
 import {BUILTIN_PROFILES, ComfyClient, isValidWorkflow} from "./comfy";
+import {fileToBase64} from "@chub-ai/stages-ts";
 
 const SK_SERVERS = 'hub_servers';
 const SK_PROFILES = 'hub_profiles_custom';
@@ -29,6 +30,9 @@ interface StageServices {
     messenger?: any;
     userId?: string;
     environment?: string;
+    /** Numeric stage id + stage auth token — used for raw storage calls. */
+    id?: number;
+    token?: string;
 }
 
 interface Runtime {
@@ -84,65 +88,136 @@ export class HubCore {
 
     private async save(sk: string, value: any) {
         try {
-            const res = await this.svc.storage?.set(sk, JSON.stringify(value)).forUser();
-            const ok = Array.isArray(res?.data) && res.data.length > 0;
-            if (!ok && res?.error) {
-                this.log('error', `storage save "${sk}" FAILED: ${String(res.error).slice(0, 140)}`);
+            const r = await this.rawUpdate([{
+                key: sk, scope_type: 'user', type: 'UPSERT',
+                chat_local: false, value: JSON.stringify(value), character_id: null,
+            }]);
+            if (r.status >= 200 && r.status < 300) {
+                this.log('info', `storage save "${sk}" ok (http ${r.status})`);
             } else {
-                this.log('info', `storage save "${sk}" ok`);
+                this.log('error', `storage save "${sk}" FAILED: http ${r.status} ${r.raw}`);
             }
         } catch (e: any) {
-            this.log('error', `storage save "${sk}" FAILED: ${String(e?.message ?? e).slice(0, 140)}`);
+            this.log('error', `storage save "${sk}" threw: ${String(e?.message ?? e).slice(0, 120)}`);
         }
     }
 
     /***
+     Raw storage calls: the library's builders call response.json()
+     unconditionally, which throws on empty-bodied 2xx responses and
+     misreports successful writes as "Failed to update." These do the
+     same requests with tolerant parsing and visible statuses.
+     ***/
+    private storageBase(): string {
+        return `https://gateway.chub.ai/api/storage/stage/${this.svc.id ?? 0}`;
+    }
+
+    private async rawUpdate(changes: any[]): Promise<{ status: number; data: any[]; error?: string; raw: string }> {
+        const res = await fetch(this.storageBase(), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.svc.token ?? ''}`,
+            },
+            body: JSON.stringify({changes}),
+        });
+        const text = await res.text();
+        let parsed: any = null;
+        try {
+            parsed = text && text.length > 0 ? JSON.parse(text) : null;
+        } catch { /* non-JSON body — tolerate */ }
+        return {
+            status: res.status,
+            data: Array.isArray(parsed?.data) ? parsed.data : [],
+            error: parsed?.error,
+            raw: (text ?? '').slice(0, 180),
+        };
+    }
+
+    private async rawQuery(fetchBody: any): Promise<{ status: number; data: any[]; error?: string; raw: string }> {
+        const res = await fetch(`${this.storageBase()}/fetch`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.svc.token ?? ''}`,
+            },
+            body: JSON.stringify(fetchBody),
+        });
+        const text = await res.text();
+        let parsed: any = null;
+        try {
+            parsed = text && text.length > 0 ? JSON.parse(text) : null;
+        } catch { /* tolerate */ }
+        return {
+            status: res.status,
+            data: Array.isArray(parsed?.data) ? parsed.data : [],
+            error: parsed?.error,
+            raw: (text ?? '').slice(0, 180),
+        };
+    }
+
+    /***
      Two fetch paths, because storage scopes are finicky:
-     1) Direct query exactly as documented (user_ids null = unfiltered).
-     2) Builder fetch scoped to this user's anonymized ID.
+     1) Unfiltered query (user_ids null).
+     2) Query pinned to this user's anonymized ID.
      ***/
     private async loadKey<T>(sk: string): Promise<T | null> {
         try {
-            const res = await this.svc.storage?.query({
+            const r = await this.rawQuery({
                 keys: [sk], character_ids: null, user_ids: null,
                 persona_ids: null, chat_local: false,
             });
-            const raw = res?.data?.[0]?.value;
+            const raw = r.data.find((d: any) => d?.key === sk)?.value;
             if (typeof raw === 'string') return JSON.parse(raw) as T;
-            if (res?.error) console.warn('hub storage query error:', res.error);
-        } catch (e) {
-            console.warn('hub storage query failed', sk, e);
+            if (r.status >= 300) this.log('error', `storage load "${sk}": http ${r.status} ${r.raw}`);
+        } catch (e: any) {
+            console.warn('rawQuery(unfiltered) failed', sk, e);
         }
         try {
-            const res = await this.svc.storage?.get([sk]).forUser(this.svc.userId ?? '');
-            const raw = res?.data?.[0]?.value;
+            const r = await this.rawQuery({
+                keys: [sk], character_ids: null,
+                user_ids: this.svc.userId ? [this.svc.userId] : null,
+                persona_ids: null, chat_local: false,
+            });
+            const raw = r.data.find((d: any) => d?.key === sk)?.value;
             if (typeof raw === 'string') return JSON.parse(raw) as T;
-        } catch (e) {
-            console.warn('hub storage builder fetch failed', sk, e);
+        } catch (e: any) {
+            console.warn('rawQuery(user) failed', sk, e);
         }
         return null;
     }
 
-    /** Diagnostics: full storage round-trip check (write → read back). */
+    /** Diagnostics: raw storage round-trip with full status visibility. */
     async probeStorage(): Promise<void> {
-        const marker = `hub-storage-test-${Date.now()}`;
-        this.log('info', `storage test: writing marker ${marker}`);
+        const marker = `t-${Date.now()}`;
+        this.log('info', `storage probe: stage id ${this.svc.id ?? '?'} — testing raw gateway calls…`);
         try {
-            const res = await this.svc.storage?.set('hub_storage_test', JSON.stringify({marker})).forUser();
-            if (!Array.isArray(res?.data) || res.data.length === 0) {
-                this.log('error', `storage test: SAVE failed${res?.error ? ` (${String(res.error).slice(0, 120)})` : ' (empty response)'}`);
-                return;
-            }
-            this.log('info', 'storage test: save ok, reading back…');
+            const w = await this.rawUpdate([{
+                key: 'hub_probe_world', scope_type: 'world', type: 'UPSERT',
+                chat_local: false, value: JSON.stringify({marker}), character_id: null,
+            }]);
+            this.log(w.status < 300 ? 'info' : 'error', `probe world upsert: http ${w.status} · ${w.raw || '(empty body = ok)'}`);
         } catch (e: any) {
-            this.log('error', `storage test: SAVE threw: ${String(e?.message ?? e).slice(0, 140)}`);
-            return;
+            this.log('error', `probe world upsert threw: ${String(e?.message ?? e).slice(0, 120)}`);
         }
-        const back = await this.loadKey<{ marker: string }>('hub_storage_test');
-        if (back?.marker === marker) {
-            this.log('info', 'storage test: ✓ roundtrip OK — persistence should work');
-        } else {
-            this.log('error', `storage test: ✗ read-back mismatch (got ${JSON.stringify(back)?.slice(0, 80) ?? 'null'}) — saves land but loads can't find them`);
+        try {
+            const u = await this.rawUpdate([{
+                key: 'hub_probe_user', scope_type: 'user', type: 'UPSERT',
+                chat_local: false, value: JSON.stringify({marker}), character_id: null,
+            }]);
+            this.log(u.status < 300 ? 'info' : 'error', `probe user upsert: http ${u.status} · ${u.raw || '(empty body = ok)'}`);
+        } catch (e: any) {
+            this.log('error', `probe user upsert threw: ${String(e?.message ?? e).slice(0, 120)}`);
+        }
+        try {
+            const q = await this.rawQuery({
+                keys: ['hub_probe_world', 'hub_probe_user'], character_ids: null,
+                user_ids: null, persona_ids: null, chat_local: false,
+            });
+            const rows = q.data.map((d: any) => `${d.key}=${String(d.value).slice(0, 30)}`).join(', ');
+            this.log(q.status < 300 ? 'info' : 'error', `probe fetch: http ${q.status} → ${rows || '(no rows)'} ${q.raw.slice(0, 80)}`);
+        } catch (e: any) {
+            this.log('error', `probe fetch threw: ${String(e?.message ?? e).slice(0, 120)}`);
         }
     }
 
@@ -509,10 +584,17 @@ export class HubCore {
     /** Upload binary content to stage storage; returns the CDN URL. */
     private async uploadFile(filename: string, bytes: Blob): Promise<string> {
         const file = new File([bytes], filename, {type: bytes.type || 'image/png'});
-        const res = await this.svc.storage?.set(filename, file).forUser();
-        const url = res?.data?.[0]?.value;
-        if (!url) throw new Error('storage upload returned no URL');
-        return String(url);
+        const b64 = await fileToBase64(file);
+        const ext = (filename.split('.').pop() ?? 'png').replace(/[^a-z0-9]/gi, '').toLowerCase();
+        const r = await this.rawUpdate([{
+            key: filename, scope_type: 'user', type: 'UPSERT', chat_local: false,
+            value: b64, character_id: null, file_extension: ext || 'png',
+        }]);
+        const url = r.data.find((d: any) => d?.key === filename)?.value;
+        if (typeof url !== 'string' || !/^https?:\/\//.test(url)) {
+            throw new Error(`upload failed (http ${r.status})`);
+        }
+        return url;
     }
 
     /***
