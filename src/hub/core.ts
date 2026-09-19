@@ -86,19 +86,50 @@ export class HubCore {
 
     /* ------------------------------------------------------- persistence */
 
+    /***
+     Two-layer persistence:
+     1) iframe localStorage — instant, offline, per-origin (primary for the registry)
+     2) Chub stage storage — cross-origin mirror, but the gateway 403s CORS
+        preflights, so it's only reachable through the local bridge.
+     ***/
+
+    private lsKey(sk: string): string {
+        return `mcpaccess:${sk}`;
+    }
+
+    private lsSave(sk: string, value: any) {
+        try {
+            if (typeof localStorage !== 'undefined') localStorage.setItem(this.lsKey(sk), JSON.stringify(value));
+        } catch (e) {
+            console.warn('localStorage save failed', sk, e);
+        }
+    }
+
+    private lsLoad<T>(sk: string): T | null {
+        try {
+            if (typeof localStorage === 'undefined') return null;
+            const raw = localStorage.getItem(this.lsKey(sk));
+            if (raw != null) return JSON.parse(raw) as T;
+        } catch (e) {
+            console.warn('localStorage load failed', sk, e);
+        }
+        return null;
+    }
+
     private async save(sk: string, value: any) {
+        this.lsSave(sk, value);
         try {
             const r = await this.rawUpdate([{
                 key: sk, scope_type: 'user', type: 'UPSERT',
                 chat_local: false, value: JSON.stringify(value), character_id: null,
             }]);
             if (r.status >= 200 && r.status < 300) {
-                this.log('info', `storage save "${sk}" ok (http ${r.status})`);
+                this.log('info', `storage mirror "${sk}" ok (http ${r.status})`);
             } else {
-                this.log('error', `storage save "${sk}" FAILED: http ${r.status} ${r.raw}`);
+                this.log('error', `storage mirror "${sk}" failed: http ${r.status} ${r.raw}`);
             }
         } catch (e: any) {
-            this.log('error', `storage save "${sk}" threw: ${String(e?.message ?? e).slice(0, 120)}`);
+            this.log('error', `storage mirror "${sk}" unreachable: ${String(e?.message ?? e).slice(0, 100)} (local copy saved)`);
         }
     }
 
@@ -107,13 +138,20 @@ export class HubCore {
      unconditionally, which throws on empty-bodied 2xx responses and
      misreports successful writes as "Failed to update." These do the
      same requests with tolerant parsing and visible statuses.
+     The gateway 403s CORS preflights from browsers, so when the local
+     bridge is configured we route through it (it answers preflights
+     properly and relays server-side).
      ***/
-    private storageBase(): string {
-        return `https://gateway.chub.ai/api/storage/stage/${this.svc.id ?? 0}`;
+    private storageEndpoint(path: string = ''): string {
+        const direct = `https://gateway.chub.ai/api/storage/stage/${this.svc.id ?? 0}${path}`;
+        if (this.bridgeBase) {
+            return `${this.bridgeBase}/corsbase/${encodeURIComponent('https://gateway.chub.ai')}/api/storage/stage/${this.svc.id ?? 0}${path}`;
+        }
+        return direct;
     }
 
     private async rawUpdate(changes: any[]): Promise<{ status: number; data: any[]; error?: string; raw: string }> {
-        const res = await fetch(this.storageBase(), {
+        const res = await fetch(this.storageEndpoint(), {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -135,7 +173,7 @@ export class HubCore {
     }
 
     private async rawQuery(fetchBody: any): Promise<{ status: number; data: any[]; error?: string; raw: string }> {
-        const res = await fetch(`${this.storageBase()}/fetch`, {
+        const res = await fetch(this.storageEndpoint('/fetch'), {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -157,11 +195,12 @@ export class HubCore {
     }
 
     /***
-     Two fetch paths, because storage scopes are finicky:
-     1) Unfiltered query (user_ids null).
-     2) Query pinned to this user's anonymized ID.
+     Registry reads: localStorage first (instant, per-origin), then the
+     Chub storage mirror (bridge-routed) for data written elsewhere.
      ***/
     private async loadKey<T>(sk: string): Promise<T | null> {
+        const local = this.lsLoad<T>(sk);
+        if (local != null) return local;
         try {
             const r = await this.rawQuery({
                 keys: [sk], character_ids: null, user_ids: null,
@@ -169,20 +208,8 @@ export class HubCore {
             });
             const raw = r.data.find((d: any) => d?.key === sk)?.value;
             if (typeof raw === 'string') return JSON.parse(raw) as T;
-            if (r.status >= 300) this.log('error', `storage load "${sk}": http ${r.status} ${r.raw}`);
         } catch (e: any) {
-            console.warn('rawQuery(unfiltered) failed', sk, e);
-        }
-        try {
-            const r = await this.rawQuery({
-                keys: [sk], character_ids: null,
-                user_ids: this.svc.userId ? [this.svc.userId] : null,
-                persona_ids: null, chat_local: false,
-            });
-            const raw = r.data.find((d: any) => d?.key === sk)?.value;
-            if (typeof raw === 'string') return JSON.parse(raw) as T;
-        } catch (e: any) {
-            console.warn('rawQuery(user) failed', sk, e);
+            console.warn('remote loadKey failed', sk, e);
         }
         return null;
     }
@@ -190,7 +217,7 @@ export class HubCore {
     /** Diagnostics: raw storage round-trip with full status visibility. */
     async probeStorage(): Promise<void> {
         const marker = `t-${Date.now()}`;
-        this.log('info', `storage probe: stage id ${this.svc.id ?? '?'} — testing raw gateway calls…`);
+        this.log('info', `storage probe: stage id ${this.svc.id ?? '?'} · routing ${this.bridgeBase ? 'via bridge' : 'DIRECT (gateway 403s preflights — start the bridge!)'}…`);
         try {
             const w = await this.rawUpdate([{
                 key: 'hub_probe_world', scope_type: 'world', type: 'UPSERT',
@@ -219,6 +246,7 @@ export class HubCore {
         } catch (e: any) {
             this.log('error', `probe fetch threw: ${String(e?.message ?? e).slice(0, 120)}`);
         }
+        this.log('info', `local persistence: localStorage ${typeof localStorage !== 'undefined' ? 'available' : 'unavailable'}`);
     }
 
     /* --------------------------------------------------------- lifecycle */
