@@ -112,9 +112,26 @@ export class HubCore {
             this.runtimes.set(srv.id, {status: 'offline', tools: []});
         }
         this.log('info', `hub loaded: ${this.servers.length} server(s)${this.bridgeBase ? ' · bridge on' : ''}`);
-        for (const srv of this.servers) {
-            if (srv.enabled) void this.refresh(srv.id);
-        }
+        // Connect enabled servers BEFORE the host's tools/list handshake so
+        // the model sees the full tool surface from the very first message.
+        // Bounded per server so a dead host can't stall the chat forever;
+        // stragglers keep connecting in the background.
+        const connectAll = this.servers
+            .filter(srv => srv.enabled)
+            .map(srv => Promise.race([
+                this.refresh(srv.id).catch(() => {}),
+                new Promise(r => setTimeout(r, 15_000)),
+            ]));
+        await Promise.all(connectAll);
+        const online = this.servers.filter(s => this.runtimeOf(s.id).status === 'online').length;
+        this.log('info', `hub ready: ${online}/${this.servers.length} server(s) connected for handshake`);
+    }
+
+    /** Tell the host (if it listens) that the tool list changed mid-session. */
+    private emitToolsChanged() {
+        try {
+            (this.svc.mcp as any)?.sendToolListChanged?.();
+        } catch { /* ignore */ }
     }
 
     async setBridgeBase(url: string): Promise<{ ok: boolean; detail?: string }> {
@@ -185,6 +202,7 @@ export class HubCore {
         this.servers = this.servers.filter(s => s.id !== id);
         this.log('server', `removed "${name ?? id}"`);
         await this.save(SK_SERVERS, this.servers);
+        this.emitToolsChanged();
         this.notify();
     }
 
@@ -200,6 +218,7 @@ export class HubCore {
             } catch { /* ignore */ }
             this.runtimes.set(id, {status: 'offline', tools: []});
             this.log('server', `disabled ${this.aliasOf(id)}`);
+            this.emitToolsChanged();
             this.notify();
         }
     }
@@ -254,6 +273,7 @@ export class HubCore {
                 this.log('server', `"${rec.alias}" online - ${tools.length} tool(s): ${tools.map(t => t.name).join(', ').slice(0, 120)}`);
             }
             this.setStatus(id, 'online');
+            this.emitToolsChanged();
         } catch (e: any) {
             const msg = classifyConnectError(e);
             this.setStatus(id, 'error', msg);
@@ -506,7 +526,7 @@ export class HubCore {
         try {
             await this.svc.messenger?.impersonate({
                 speaker_id: this.svc.userId,
-                message: '![mcp-access-probe](https://picsum.photos/seed/mcpaccess/640/360)',
+                message: `![mcp-access-probe](https://picsum.photos/seed/${Date.now()}/640/360)`,
             });
             this.log('info', 'markdown-image probe sent to chat - look for a rendered image in the log');
         } catch (e: any) {
