@@ -126,6 +126,10 @@ export function HubRoot({hub, environment}: { hub: HubCore; environment: string 
                             onClick={async () => { setProbeNote(''); await hub.probeMarkdownImage(); setProbeNote('sent — check chat log for a rendered image'); }}>
                         Test: markdown image in chat
                     </button>
+                    <button className="mcp-btn mcp-btn-ghost" style={{fontSize: 11}}
+                            onClick={() => void hub.probeStorage()}>
+                        Test: storage roundtrip
+                    </button>
                     {probeNote && <span style={{fontSize: 11, color: palette.accent}}>{probeNote}</span>}
                 </div>
                 <div style={{fontSize: 10.5, color: palette.dim, marginBottom: 4}}>Host traffic into iframe:</div>

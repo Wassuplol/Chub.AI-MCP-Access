@@ -84,21 +84,66 @@ export class HubCore {
 
     private async save(sk: string, value: any) {
         try {
-            await this.svc.storage?.set(sk, JSON.stringify(value)).forUser();
+            const res = await this.svc.storage?.set(sk, JSON.stringify(value)).forUser();
+            const ok = Array.isArray(res?.data) && res.data.length > 0;
+            if (!ok && res?.error) {
+                this.log('error', `storage save "${sk}" FAILED: ${String(res.error).slice(0, 140)}`);
+            } else {
+                this.log('info', `storage save "${sk}" ok`);
+            }
         } catch (e) {
-            console.warn('hub storage save failed', sk, e);
+            this.log('error', `storage save "${sk}" FAILED: ${String(e?.message ?? e).slice(0, 140)}`);
         }
     }
 
+    /***
+     Two fetch paths, because storage scopes are finicky:
+     1) Direct query exactly as documented (user_ids null = unfiltered).
+     2) Builder fetch scoped to this user's anonymized ID.
+     ***/
     private async loadKey<T>(sk: string): Promise<T | null> {
+        try {
+            const res = await this.svc.storage?.query({
+                keys: [sk], character_ids: null, user_ids: null,
+                persona_ids: null, chat_local: false,
+            });
+            const raw = res?.data?.[0]?.value;
+            if (typeof raw === 'string') return JSON.parse(raw) as T;
+            if (res?.error) console.warn('hub storage query error:', res.error);
+        } catch (e) {
+            console.warn('hub storage query failed', sk, e);
+        }
         try {
             const res = await this.svc.storage?.get([sk]).forUser(this.svc.userId ?? '');
             const raw = res?.data?.[0]?.value;
             if (typeof raw === 'string') return JSON.parse(raw) as T;
         } catch (e) {
-            console.warn('hub storage load failed', sk, e);
+            console.warn('hub storage builder fetch failed', sk, e);
         }
         return null;
+    }
+
+    /** Diagnostics: full storage round-trip check (write → read back). */
+    async probeStorage(): Promise<void> {
+        const marker = `hub-storage-test-${Date.now()}`;
+        this.log('info', `storage test: writing marker ${marker}`);
+        try {
+            const res = await this.svc.storage?.set('hub_storage_test', JSON.stringify({marker})).forUser();
+            if (!Array.isArray(res?.data) || res.data.length === 0) {
+                this.log('error', `storage test: SAVE failed${res?.error ? ` (${String(res.error).slice(0, 120)})` : ' (empty response)'}`);
+                return;
+            }
+            this.log('info', 'storage test: save ok, reading back…');
+        } catch (e: any) {
+            this.log('error', `storage test: SAVE threw: ${String(e?.message ?? e).slice(0, 140)}`);
+            return;
+        }
+        const back = await this.loadKey<{ marker: string }>('hub_storage_test');
+        if (back?.marker === marker) {
+            this.log('info', 'storage test: ✓ roundtrip OK — persistence should work');
+        } else {
+            this.log('error', `storage test: ✗ read-back mismatch (got ${JSON.stringify(back)?.slice(0, 80) ?? 'null'}) — saves land but loads can't find them`);
+        }
     }
 
     /* --------------------------------------------------------- lifecycle */
@@ -181,6 +226,7 @@ export class HubCore {
         this.servers = [...this.servers, rec];
         this.runtimes.set(rec.id, {status: 'offline', tools: []});
         this.log('server', `added "${rec.alias}" (${rec.kind})`);
+        this.log('info', 'note: the model sees new tools after a page refresh (the chat reads the tool list once, at load)');
         await this.save(SK_SERVERS, this.servers);
         if (rec.enabled) void this.refresh(rec.id);
     }
