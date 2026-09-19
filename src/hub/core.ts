@@ -91,7 +91,7 @@ export class HubCore {
             } else {
                 this.log('info', `storage save "${sk}" ok`);
             }
-        } catch (e) {
+        } catch (e: any) {
             this.log('error', `storage save "${sk}" FAILED: ${String(e?.message ?? e).slice(0, 140)}`);
         }
     }
